@@ -92,49 +92,64 @@ def Afbar(x):
     return Af(x[:,::-1])
 
 
-def mixing_model(x):
+def mixing_model(x, flavor=True):
+    """Time-dependent density for an initial D0 (flavor=True) or D0bar (flavor=False)."""
     # Calculate the amplitudes - cached
     ampl_dz = Af(c_phsp.data1(x))
     ampl_dzb = Afbar(c_phsp.data1(x))
+    # for an initial D0bar the roles of A_f and Abar_f are exchanged (and q/p -> p/q)
+    ampl_dir, ampl_cnj = (ampl_dz, ampl_dzb) if flavor else (ampl_dzb, ampl_dz)
     # Calculate the model from the mixing parameters and time evolution operators
     def _model(x_mix_par, y_mix_par, qop_alpha_par, qop_phase_par):
         t = c_phsp.phsp2.t(c_phsp.data2(x))
-        tep = atfm.psip(t, y_mix_par, tdz)
-        tem = atfm.psim(t, y_mix_par, tdz)
-        tei = atfm.psii(t, x_mix_par, tdz)
+        # DecayTimePhaseSpace draws t from exp(-t/tau): use the time evolution
+        # relative to that exponential, both for the toys and for the integrals
+        tep = atfm.psip(t, y_mix_par, tdz, relative_to_decay=True)
+        tem = atfm.psim(t, y_mix_par, tdz, relative_to_decay=True)
+        tei = atfm.psii(t, x_mix_par, tdz, relative_to_decay=True)
         # calculate the amplitude density
         qop_par = atfi.tan(qop_alpha_par)
-        dens = atfm.mixing_density(ampl_dz, ampl_dzb, atfi.complex(qop_par * atfi.cos(qop_phase_par), qop_par * atfi.sin(qop_phase_par)), tep, tem, tei)
+        qoverp = atfi.complex(qop_par * atfi.cos(qop_phase_par), qop_par * atfi.sin(qop_phase_par))
+        dens = atfm.mixing_density(ampl_dir, ampl_cnj, qoverp, tep, tem, tei, flavor=flavor)
         return dens
     return _model
 
 
-def toymc_model(x, switches=4 * [1]):
-    return mixing_model(x)(
-        x_mix_par=xmix,
-        y_mix_par=ymix,
-        qop_alpha_par=atfi.atan(qop),
-        qop_phase_par=qop_phase
-    )
+def toymc_model(flavor):
+    def _pdf(x):
+        return mixing_model(x, flavor)(
+            x_mix_par=xmix,
+            y_mix_par=ymix,
+            qop_alpha_par=atfi.atan(qop),
+            qop_phase_par=qop_phase
+        )
+    return _pdf
 
 
-# TF graph for unbinned negalite log likelihood (the quantity to be minimised)
-def nll(data, norm):
-    data_model = mixing_model(data)
-    norm_model = mixing_model(norm)
+# TF graph for unbinned negalite log likelihood (the quantity to be minimised).
+# D0 and D0bar decays are needed together: with D0 decays only, |q/p| and (x, y)
+# are nearly degenerate. Each flavour is normalised separately (independent yields).
+def nll(data_dz, data_dzb, norm):
+    models = [(mixing_model(data_dz, True), mixing_model(norm, True)),
+              (mixing_model(data_dzb, False), mixing_model(norm, False))]
 
     @atfi.function
     def _nll(pars):
-        return atfl.unbinned_nll(data_model(**pars), atfl.integral(norm_model(**pars)))
+        return sum(atfl.unbinned_nll(data_model(**pars), atfl.integral(norm_model(**pars)))
+                   for data_model, norm_model in models)
 
     return _nll
 
 
-toy_sample = tft.run_toymc(
-    toymc_model, c_phsp, ntoys, maximum=1.0e-20, chunk=1000000, components=False
+toy_sample_dz = tft.run_toymc(
+    toymc_model(True), c_phsp, ntoys, maximum=1.0e-20, chunk=1000000, components=False
+)
+toy_sample_dzb = tft.run_toymc(
+    toymc_model(False), c_phsp, ntoys, maximum=1.0e-20, chunk=1000000, components=False
 )
 
-print(toy_sample)
+print(toy_sample_dz)
+print(toy_sample_dzb)
 
 norm_sample = c_phsp.uniform_sample(nnorm)
 
@@ -152,7 +167,7 @@ pars = [
 #         p.fix()
 
 # Run MINUIT minimisation of the neg. log likelihood
-result = tfo.run_minuit(nll(toy_sample, norm_sample), pars)
+result = tfo.run_minuit(nll(toy_sample_dz, toy_sample_dzb, norm_sample), pars)
 print(result)
 
 cov = result['covariance']
@@ -162,16 +177,21 @@ print(f"{result['time']/result['func_calls']} sec per function call")
 fitted_pars = {p: atfi.const(v[0]) for p, v in result["params"].items()}
 
 
-def fitted_model(x):
-    return mixing_model(x)(**fitted_pars)
+def fitted_model(flavor):
+    def _pdf(x):
+        return mixing_model(x, flavor)(**fitted_pars)
+    return _pdf
 
 
 # ff = tfo.calculate_fit_fractions(fitted_model, norm_sample)
 # print(ff)
 
-fitted_sample = tft.run_toymc(
-    fitted_model, c_phsp, nnorm, maximum=1.0e-20, chunk=1000000, components=True
-)
+# Plot D0 and D0bar decays together
+toy_sample = atfi.concat([toy_sample_dz, toy_sample_dzb], axis=0)
+fitted_sample = atfi.concat([
+    tft.run_toymc(fitted_model(flavor), c_phsp, nnorm // 2, maximum=1.0e-20, chunk=1000000, components=False)
+    for flavor in (True, False)
+], axis=0)
 
 # Plot results
 import matplotlib.pyplot as plt
